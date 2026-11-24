@@ -1,0 +1,209 @@
+//@version=5
+strategy("Drift VWAP Pullback - No Repaint - Funded 100K", overlay=true,
+     default_qty_type=strategy.fixed, default_qty_value=1,     // 1 συμβόλαιο
+     initial_capital=100000, currency=currency.USD,
+     calc_on_every_tick=false,
+     process_orders_on_close=false)  // order γεμίζει στο OPEN του επόμενου bar, όχι στο close αυτού
+
+tz = "America/New_York"
+
+// ---------------------------------------------------------------------
+// BACKTEST WINDOW: ξεκινάει 23 ΣΕΠΤΕΜΒΡΙΟΥ 2026 (μπορείς να το αλλάξεις στα Inputs)
+// ---------------------------------------------------------------------
+startDate = input.time(timestamp("2026-10-01 00:00 +0000"), "Backtest Start Date")
+inBacktestWindow = time >= startDate
+
+// ---------------------------------------------------------------------
+// FUNDED ACCOUNT RULES
+// PASS: +10% equity  |  FAIL: -10% total DD  ή  -5% daily DD
+// ---------------------------------------------------------------------
+startCapital    = input.float(100000, "Αρχικό Κεφάλαιο ($)")
+profitTargetPct = input.float(10, "Profit Target για PASS (%)")
+maxTotalDDPct   = input.float(10, "Max Total Drawdown για FAIL (%)")
+maxDailyDDPct   = input.float(5,  "Max Daily Drawdown για FAIL (%)")
+
+// ---------------------------------------------------------------------
+// 15m TREND DATA — ΧΩΡΙΣ REPAINTING (ασφαλέστερη μέθοδος)
+// ---------------------------------------------------------------------
+close15           = request.security(syminfo.tickerid, "15", close[1],  lookahead=barmerge.lookahead_off)
+close15_4bars_ago = request.security(syminfo.tickerid, "15", close[5],  lookahead=barmerge.lookahead_off)
+h15    = request.security(syminfo.tickerid, "15", high[1],   lookahead=barmerge.lookahead_off)
+l15    = request.security(syminfo.tickerid, "15", low[1],    lookahead=barmerge.lookahead_off)
+v15    = request.security(syminfo.tickerid, "15", volume[1], lookahead=barmerge.lookahead_off)
+t15    = request.security(syminfo.tickerid, "15", time[1],   lookahead=barmerge.lookahead_off)
+
+// --- VWAP υπολογισμένο ΕΞΩ από το security(), εδώ στο 5m context ---
+isNew15Bar = ta.change(t15) != 0
+tp15 = (h15 + l15 + close15) / 3
+is15SessionStart = hour(t15, tz) == 9 and minute(t15, tz) == 30
+
+var float cumPV = na
+var float cumV  = na
+if isNew15Bar
+    if is15SessionStart or na(cumV)
+        cumPV := tp15 * v15
+        cumV  := v15
+    else
+        cumPV := cumPV + tp15 * v15
+        cumV  := cumV + v15
+
+vwap15      = cumV > 0 ? cumPV / cumV : na
+vwap15_prev = vwap15[3]   // 3 πεντάλεπτα πίσω = 1 προηγούμενο 15m κερί
+
+minMomentumPct = input.float(0.1, "Ελάχιστο Momentum (%)", step=0.05)
+momentumPct = (close15 - close15_4bars_ago) / close15_4bars_ago * 100
+
+longTrendOK  = close15 > vwap15 and vwap15 > vwap15_prev and momentumPct >=  minMomentumPct
+shortTrendOK = close15 < vwap15 and vwap15 < vwap15_prev and momentumPct <= -minMomentumPct
+
+plot(vwap15, title="15m VWAP (κλειδωμένο 09:30 EST)", color=color.orange, linewidth=2)
+
+// ---------------------------------------------------------------------
+// TIME WINDOWS
+// ---------------------------------------------------------------------
+inSession       = time(timeframe.period, "1030-1530", tz)
+isHardCloseTime = hour(time, tz) == 15 and minute(time, tz) >= 55
+
+// ---------------------------------------------------------------------
+// GUARDRAILS: reset ημερησίων μετρητών σε κάθε νέα ημέρα
+// ---------------------------------------------------------------------
+var int tradesToday        = 0
+var int consecLosses       = 0
+var int lastClosedTradeCnt = 0
+newDay = ta.change(time("D", tz)) != 0
+
+if newDay
+    tradesToday  := 0
+    consecLosses := 0
+
+if strategy.closedtrades > lastClosedTradeCnt
+    lastTradeProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if lastTradeProfit < 0
+        consecLosses += 1
+    else
+        consecLosses := 0
+    tradesToday        += 1
+    lastClosedTradeCnt := strategy.closedtrades
+
+// ---------------------------------------------------------------------
+// FUNDED ACCOUNT TRACKING (equity / daily DD / total DD / pass-fail)
+// ---------------------------------------------------------------------
+var float dayStartEquity = na
+if newDay or na(dayStartEquity)
+    dayStartEquity := strategy.equity
+
+dailyDDPct = (strategy.equity - dayStartEquity) / dayStartEquity * 100
+totalDDPct = (strategy.equity - startCapital) / startCapital * 100
+
+// ---------------------------------------------------------------------
+// DAILY LOSS CAP (SOFT STOP) — 4%
+// ---------------------------------------------------------------------
+dailyLossCapPct = input.float(4, "Daily Loss Cap - Soft Stop (%)")
+dailyLossCapHit = dailyDDPct <= -dailyLossCapPct
+
+if dailyLossCapHit and strategy.position_size != 0
+    strategy.close_all(comment="Daily Loss Cap 4% - Soft Stop")
+
+var bool accountPassed = false
+var bool accountFailed = false
+
+if not accountPassed and not accountFailed
+    if totalDDPct >= profitTargetPct
+        accountPassed := true
+    else if totalDDPct <= -maxTotalDDPct
+        accountFailed := true
+    else if dailyDDPct <= -maxDailyDDPct
+        accountFailed := true
+
+accountActive = not accountPassed and not accountFailed
+
+if (accountPassed or accountFailed) and strategy.position_size != 0
+    strategy.close_all(comment="Account Passed/Failed - Flatten")
+
+guardrailsOK = tradesToday < 4 and consecLosses < 2 and accountActive and inBacktestWindow and not dailyLossCapHit
+
+// ---------------------------------------------------------------------
+// 5m TRIGGER — αξιολογείται ΑΚΡΙΒΩΣ στο close (calc_on_every_tick=false)
+// ---------------------------------------------------------------------
+redCandle5   = close < open
+greenCandle5 = close > open
+
+longSignal  = longTrendOK  and redCandle5   and inSession and guardrailsOK and strategy.position_size == 0
+shortSignal = shortTrendOK and greenCandle5 and inSession and guardrailsOK and strategy.position_size == 0
+
+// ---------------------------------------------------------------------
+// ENTRIES
+// ---------------------------------------------------------------------
+if longSignal
+    strategy.entry("LONG", strategy.long)
+
+if shortSignal
+    strategy.entry("SHORT", strategy.short)
+
+// ---------------------------------------------------------------------
+// TP / SL
+// ---------------------------------------------------------------------
+tpLongTicks  = 40 / syminfo.mintick
+slLongTicks  = 80 / syminfo.mintick
+tpShortTicks = 50 / syminfo.mintick
+slShortTicks = 80 / syminfo.mintick
+
+if strategy.position_size > 0
+    strategy.exit("TP/SL LONG", from_entry="LONG", profit=tpLongTicks, loss=slLongTicks)
+
+if strategy.position_size < 0
+    strategy.exit("TP/SL SHORT", from_entry="SHORT", profit=tpShortTicks, loss=slShortTicks)
+
+// ---------------------------------------------------------------------
+// HARD CLOSE 15:55 EST
+// ---------------------------------------------------------------------
+if isHardCloseTime and strategy.position_size != 0
+    strategy.close_all(comment="Hard Close 15:55")
+
+// ---------------------------------------------------------------------
+// VISUAL
+// ---------------------------------------------------------------------
+bgcolor(inSession ? na : color.new(color.gray, 90))
+plotshape(longSignal,  title="Long Signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(shortSignal, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.tiny)
+
+// ---------------------------------------------------------------------
+// STATUS TABLE
+// ---------------------------------------------------------------------
+var table statusTbl = table.new(position.top_left, 2, 16, border_width=1)
+if barstate.islast
+    statusStr  = accountPassed ? "PASSED" : accountFailed ? "FAILED" : "ACTIVE"
+    statusCol  = accountPassed ? color.green : accountFailed ? color.red : color.gray
+    winRatePct = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0
+    table.cell(statusTbl, 0, 0, "Start Date",   text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 0, str.format("{0,date,dd/MM/yyyy}", startDate), text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 1, "Start Capital", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 1, "$" + str.tostring(startCapital, "#,###"), text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 2, "Target (PASS)", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 2, "+" + str.tostring(profitTargetPct, "#") + "%", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 3, "Max Total DD",  text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 3, "-" + str.tostring(maxTotalDDPct, "#") + "%", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 4, "Max Daily DD",  text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 4, "-" + str.tostring(maxDailyDDPct, "#") + "%", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 5, "Status",     text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 5, statusStr,    text_color=color.white, bgcolor=statusCol)
+    table.cell(statusTbl, 0, 6, "Equity",     text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 6, "$" + str.tostring(strategy.equity, "#,###.##"), text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 7, "Total DD %", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 7, str.tostring(totalDDPct, "#.##") + "%",  text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 8, "Daily DD %", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 8, str.tostring(dailyDDPct, "#.##") + "%",  text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 9, "Net P&L $", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 9, "$" + str.tostring(strategy.netprofit, "#,###.##"), text_color=color.white, bgcolor=strategy.netprofit >= 0 ? color.green : color.red)
+    table.cell(statusTbl, 0, 10, "Total Trades", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 10, str.tostring(strategy.closedtrades), text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 11, "Wins (W)", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 11, str.tostring(strategy.wintrades), text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 12, "Losses (L)", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 12, str.tostring(strategy.losstrades), text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 13, "Win Rate %", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 13, str.tostring(winRatePct, "#.#") + "%", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 14, "Trades Today", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 14, str.tostring(tradesToday) + " / 4", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 0, 15, "Daily Cap (4%)", text_color=color.white, bgcolor=color.navy)
+    table.cell(statusTbl, 1, 15, dailyLossCapHit ? "HIT - PAUSED" : "OK", text_color=color.white, bgcolor=dailyLossCapHit ? color.red : color.green)
