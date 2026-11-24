@@ -1,0 +1,58 @@
+//@version=5
+strategy("ES RSI(2) Mean Reversion (SMA200 filter)", overlay=true,
+     initial_capital=100000, pyramiding=0, calc_on_every_tick=false,
+     process_orders_on_close=false)
+
+// ================= INPUTS =================
+grpS = "Signal"
+smaLen   = input.int(200, "Trend filter SMA length", minval=1, group=grpS)
+rsiLen   = input.int(2,   "RSI length", minval=1, group=grpS)
+entryLvl = input.float(20.0, "Buy when RSI below", group=grpS)
+exitLvl  = input.float(70.0, "Sell when RSI above", group=grpS)
+
+grpR = "Risk (optional)"
+useStop  = input.bool(false, "Enable stop loss", group=grpR)
+stopPct  = input.float(3.0, "Stop loss % from entry", step=0.5, group=grpR)
+useTime  = input.bool(false, "Enable time stop", group=grpR)
+maxBars  = input.int(10, "Max days in trade", minval=1, group=grpR)
+
+grpP = "Position size"
+sizing   = input.string("Fixed contracts", "Sizing", options=["Fixed contracts", "% of equity"], group=grpP)
+fixedQty = input.int(1, "Contracts (fixed)", minval=1, group=grpP)
+eqPct    = input.float(100.0, "% of equity (notional)", step=10, group=grpP)
+
+grpD = "Backtest range"
+startYr  = input.int(2000, "Start year", group=grpD)
+endYr    = input.int(2100, "End year", group=grpD)
+
+// ================= INDICATORS =================
+sma = ta.sma(close, smaLen)
+rsi = ta.rsi(close, rsiLen)
+
+inRange = year >= startYr and year <= endYr
+
+// ================= SIGNALS (bar close -> fill next open) =================
+uptrend   = close > sma
+buySig    = inRange and uptrend and rsi < entryLvl and strategy.position_size == 0
+exitSig   = rsi > exitLvl
+
+// ================= SIZING =================
+qty = sizing == "Fixed contracts" ? fixedQty :
+     math.max(1, math.floor(strategy.equity * eqPct / 100 / (close * syminfo.pointvalue)))
+
+// ================= ORDERS =================
+if buySig
+    strategy.entry("Long", strategy.long, qty=qty)
+
+if strategy.position_size > 0
+    if exitSig
+        strategy.close("Long", comment="RSI exit")
+    if useStop
+        strategy.exit("Stop", "Long", stop=strategy.position_avg_price * (1 - stopPct / 100))
+    if useTime and bar_index - strategy.opentrades.entry_bar_index(0) >= maxBars
+        strategy.close("Long", comment="Time stop")
+
+// ================= PLOTS =================
+plot(sma, "SMA", color=color.orange, linewidth=2)
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 92) : na)
+plotshape(buySig, "Buy", shape.triangleup, location.belowbar, color.green, size=size.tiny)
