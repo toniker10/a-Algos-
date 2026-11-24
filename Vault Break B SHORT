@@ -1,0 +1,64 @@
+//@version=5
+strategy("Vault Break B  (k0.5 ATR20 TP60 SL40, long)", overlay=true, pyramiding=0,
+     initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=1.0,
+     slippage=2, calc_on_every_tick=false, process_orders_on_close=false)
+
+// ---------- ΠΑΡΑΜΕΤΡΟΙ (κλειδωμένες, μην τις αλλάζεις) ----------
+K       = input.float(0.5, "k (× ATR)",        step=0.1)
+ATRN    = input.int(20,   "ATR ημέρες")
+TP_PTS  = input.float(60.0, "TP (points)")
+SL_PTS  = input.float(40.0, "SL (points)")
+START_M = input.int(570,  "Πρώτο signal bar (λεπτά CT, 570 = 09:30)")   // είσοδος από 10:00
+END_M   = input.int(870,  "Τελευταίο signal bar (λεπτά CT, 870 = 14:30)") // έξοδος 15:00
+TZ = "America/Chicago"
+
+// ---------- ΗΜΕΡΗΣΙΟ ΑΝΟΙΓΜΑ (μεσάνυχτα CT) ΚΑΙ ATR ----------
+var float dayO = na
+var float dayH = na
+var float dayL = na
+var float pc   = na          // κλείσιμο προηγούμενης ημέρας
+var int   dayBars = 0
+var bool  validDay = false
+var bool  traded = false
+var float[] trs = array.new_float()
+
+newDay = dayofmonth(time, TZ) != dayofmonth(time[1], TZ)
+if newDay
+    if not na(dayH) and dayBars >= 20 and validDay
+        tr = na(pc) ? dayH - dayL : math.max(dayH - dayL, math.max(math.abs(dayH - pc), math.abs(dayL - pc)))
+        array.push(trs, tr)
+        if array.size(trs) > ATRN
+            array.shift(trs)
+        pc := close[1]
+    dayO := open
+    dayH := high
+    dayL := low
+    dayBars := 1
+    validDay := hour(time, TZ) == 0 and minute(time, TZ) < 30   // η μέρα ξεκινά από τα μεσάνυχτα
+    traded := false
+else
+    dayH := math.max(dayH, high)
+    dayL := math.min(dayL, low)
+    dayBars += 1
+
+atr = array.size(trs) >= ATRN ? array.avg(trs) : na
+barrier = dayO + K * atr
+
+// ---------- ΣΗΜΑ ----------
+tod = hour(time, TZ) * 60 + minute(time, TZ)       // αρχή της τρέχουσας μπάρας σε λεπτά CT
+inWin = tod >= START_M and tod <= END_M            // η επόμενη μπάρα ξεκινά 10:00 .. 14:30
+sig = validDay and not na(barrier) and close > barrier and inWin and not traded and strategy.position_size == 0
+
+if sig
+    traded := true
+    strategy.entry("L", strategy.long)                                   // fill στο open της επόμενης μπάρας
+    strategy.exit("X", "L", profit=TP_PTS / syminfo.mintick, loss=SL_PTS / syminfo.mintick)
+
+// ---------- ΧΡΟΝΙΚΗ ΕΞΟΔΟΣ 15:00 CT ----------
+if strategy.position_size > 0 and tod >= END_M
+    strategy.close("L", comment="15:00")
+
+plot(validDay ? barrier : na, "Noise barrier", color=color.orange, style=plot.style_linebr)
+plot(validDay ? dayO : na, "Midnight open", color=color.gray, style=plot.style_linebr)
+bgcolor(sig ? color.new(color.green, 85) : na)
